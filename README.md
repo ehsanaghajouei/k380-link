@@ -2,7 +2,7 @@
 
 A small Linux daemon that tries to stop a Bluetooth keyboard (written for the Logitech K380) from dropping its connection while you type.
 
-It was written for an Intel AX211 laptop, where the K380 kept disconnecting with reason `0x08` (Connection Timeout). In a btmon capture of one drop, the laptop's request to wake the link from sniff (low-power) mode timed out about 5 seconds after the last keystroke, and then the link dropped.
+It was written for a K380 that kept disconnecting with reason `0x08` (Connection Timeout). In a btmon capture of one drop, the host's request to wake the link from sniff (low-power) mode timed out about 5 seconds after the last keystroke, and then the link dropped.
 
 > **Status: experimental.** Keeping the link out of sniff mode has not been shown to prevent these drops. The automatic reconnect has not yet run after a real drop.
 
@@ -26,13 +26,14 @@ It sends HCI commands over a raw HCI socket and talks to bluetoothd over sd-bus.
 
 ## Build and install
 
-1. Find your keyboard's address:
+1. Find your keyboard's address and your adapter's address:
 
    ```sh
-   bluetoothctl devices
+   bluetoothctl devices   # keyboard
+   bluetoothctl list      # adapter ("Controller ...")
    ```
 
-2. In `k380-link.service`, replace `XX:XX:XX:XX:XX:XX` with that address.
+2. In `k380-link.service`, replace `XX:XX:XX:XX:XX:XX` with the keyboard's address and `YY:YY:YY:YY:YY:YY` with the adapter's address.
 
 3. Build, install and start it:
 
@@ -46,17 +47,20 @@ It sends HCI commands over a raw HCI socket and talks to bluetoothd over sd-bus.
 ## Usage
 
 ```
-k380-link -a BDADDR [-i HCI_INDEX] [-w RECONNECT_WAIT_S] [-t RECONNECT_TRIES]
+k380-link -a BDADDR [-A ADAPTER_BDADDR | -i HCI_INDEX] [-w RECONNECT_WAIT_S] [-t RECONNECT_TRIES]
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
 | `-a` | (required) | The keyboard's Bluetooth address |
-| `-i` | `0` | Controller index (`hci0`) |
+| `-A` | (none) | The adapter's Bluetooth address. Its controller index is looked up at each start. Can't be combined with `-i` |
+| `-i` | `0` | Controller index (`hci0`), used when `-A` isn't given |
+
+Use `-A` if your adapter's index changes. Some adapters re-register after suspend/resume and come back with a different index (`hci0` → `hci1`). With a fixed `-i`, the service then fails with `bind hci0: No such device` until the index changes back. When the adapter disappears, k380-link exits and systemd restarts it, and with `-A` it finds the adapter under its new index.
 | `-w` | `3` | Seconds to wait after a drop before each reconnect attempt |
 | `-t` | `3` | Number of reconnect attempts before giving up |
 
-To try it in the foreground first: `sudo ./k380-link -a XX:XX:XX:XX:XX:XX`
+To try it in the foreground first: `sudo ./k380-link -a XX:XX:XX:XX:XX:XX -A YY:YY:YY:YY:YY:YY`
 
 ## Commands
 

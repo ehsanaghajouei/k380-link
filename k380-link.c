@@ -28,6 +28,8 @@
 #define SOL_HCI         0
 #define HCI_FILTER      2
 #define HCI_CHANNEL_RAW 0
+#define HCIGETDEVLIST   _IOR('H', 210, int)
+#define HCIGETDEVINFO   _IOR('H', 211, int)
 #define HCIGETCONNLIST  _IOR('H', 212, int)
 #define BT_CONNECTED    1
 
@@ -70,6 +72,26 @@ struct hci_ufilter {
 	uint32_t type_mask;
 	uint32_t event_mask[2];
 	uint16_t opcode;
+};
+
+struct hci_dev_list_req {
+	uint16_t dev_num;
+	struct {
+		uint16_t dev_id;
+		uint32_t dev_opt;
+	} dev_req[16];
+};
+
+struct hci_dev_info {
+	uint16_t dev_id;
+	char name[8];
+	uint8_t bdaddr[6];
+	uint32_t flags;
+	uint8_t type;
+	uint8_t features[8];
+	uint32_t pkt_type, link_policy, link_mode;
+	uint16_t acl_mtu, acl_pkts, sco_mtu, sco_pkts;
+	uint32_t stat[10]; /* struct hci_dev_stats */
 };
 
 struct hci_conn_info {
@@ -176,6 +198,34 @@ static void write_policy(uint16_t policy)
 	uint8_t p[4] = { st.handle & 0xff, st.handle >> 8, policy & 0xff, policy >> 8 };
 
 	send_cmd(OP_WRITE_LINK_POLICY, p, sizeof(p));
+}
+
+/* Parses "AA:BB:CC:DD:EE:FF" into wire order (little-endian). */
+static bool parse_addr(const char *s, uint8_t out[6])
+{
+	unsigned b[6];
+
+	if (sscanf(s, "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+		return false;
+	for (int i = 0; i < 6; i++)
+		out[5 - i] = b[i];
+	return true;
+}
+
+/* The adapter's index changes each time it re-registers (e.g. after resume), its address doesn't. */
+static int find_adapter(const uint8_t *addr)
+{
+	struct hci_dev_list_req dl = { .dev_num = 16 };
+
+	if (ioctl(st.sock, HCIGETDEVLIST, &dl) < 0)
+		return -errno;
+	for (int i = 0; i < dl.dev_num; i++) {
+		struct hci_dev_info di = { .dev_id = dl.dev_req[i].dev_id };
+
+		if (ioctl(st.sock, HCIGETDEVINFO, &di) == 0 && !memcmp(di.bdaddr, addr, 6))
+			return di.dev_id;
+	}
+	return -ENODEV;
 }
 
 static int find_handle(void)
@@ -415,36 +465,36 @@ static void tick(void)
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "usage: %s -a BDADDR [-i HCI_INDEX] [-w RECONNECT_WAIT_S] [-t RECONNECT_TRIES]\n", prog);
+	fprintf(stderr, "usage: %s -a BDADDR [-A ADAPTER_BDADDR | -i HCI_INDEX] [-w RECONNECT_WAIT_S] [-t RECONNECT_TRIES]\n",
+		prog);
 	exit(2);
 }
 
 int main(int argc, char **argv)
 {
-	const char *addr = NULL;
-	unsigned b[6];
+	const char *addr = NULL, *adapter = NULL;
+	uint8_t adapter_addr[6];
+	const uint8_t *a = st.addr;
+	bool dev_set = false;
 	int opt, r, ret = 0;
 	struct sigaction sa = { .sa_handler = on_signal };
 	struct sockaddr_hci sh = { .hci_family = AF_BLUETOOTH, .hci_channel = HCI_CHANNEL_RAW };
 	struct hci_ufilter filter = { .type_mask = 1u << HCI_EVENT_PKT, .event_mask = { ~0u, ~0u } };
 	uint64_t next_tick;
 
-	while ((opt = getopt(argc, argv, "a:i:w:t:")) != -1) {
+	while ((opt = getopt(argc, argv, "a:A:i:w:t:")) != -1) {
 		switch (opt) {
 		case 'a': addr = optarg; break;
-		case 'i': st.dev = atoi(optarg); break;
+		case 'A': adapter = optarg; break;
+		case 'i': st.dev = atoi(optarg); dev_set = true; break;
 		case 'w': st.wait_s = atoi(optarg); break;
 		case 't': st.max_tries = atoi(optarg); break;
 		default: usage(argv[0]);
 		}
 	}
-	if (!addr || sscanf(addr, "%2x:%2x:%2x:%2x:%2x:%2x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
+	if (!addr || !parse_addr(addr, st.addr) || (adapter && (dev_set || !parse_addr(adapter, adapter_addr))))
 		usage(argv[0]);
-	for (int i = 0; i < 6; i++)
-		st.addr[5 - i] = b[i];
-	snprintf(st.addr_str, sizeof(st.addr_str), "%02X:%02X:%02X:%02X:%02X:%02X", b[0], b[1], b[2], b[3], b[4], b[5]);
-	snprintf(st.dbus_path, sizeof(st.dbus_path), "/org/bluez/hci%u/dev_%02X_%02X_%02X_%02X_%02X_%02X", st.dev,
-		 b[0], b[1], b[2], b[3], b[4], b[5]);
+	snprintf(st.addr_str, sizeof(st.addr_str), "%02X:%02X:%02X:%02X:%02X:%02X", a[5], a[4], a[3], a[2], a[1], a[0]);
 
 	setvbuf(stdout, NULL, _IOLBF, 0);
 	sigaction(SIGTERM, &sa, NULL);
@@ -455,6 +505,16 @@ int main(int argc, char **argv)
 		logp(LOG_ERR, "HCI socket: %s", strerror(errno));
 		return 1;
 	}
+	if (adapter) {
+		r = find_adapter(adapter_addr);
+		if (r < 0) {
+			logp(LOG_ERR, "adapter %s: %s", adapter, strerror(-r));
+			return 1;
+		}
+		st.dev = r;
+	}
+	snprintf(st.dbus_path, sizeof(st.dbus_path), "/org/bluez/hci%u/dev_%02X_%02X_%02X_%02X_%02X_%02X", st.dev,
+		 a[5], a[4], a[3], a[2], a[1], a[0]);
 	sh.hci_dev = st.dev;
 	if (bind(st.sock, (struct sockaddr *)&sh, sizeof(sh)) < 0) {
 		logp(LOG_ERR, "bind hci%u: %s", st.dev, strerror(errno));
